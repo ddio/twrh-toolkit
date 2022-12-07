@@ -9,10 +9,21 @@ Please run TWRH crawler yourself, so to download required field.
 
 ```bash
 # grep PATTERNS in given FILEs
-node ./hgrep.js PATTERNS [FILE...]
+node ./hgrep.js -p PATTERNS [FILE...]
 ```
 
 ```bash
 # support gzip
-node ./hgrep.js --gzip PATTERNS [FILE...]
+node ./hgrep.js --gzip -p PATTERNS [FILE...]
+```
+
+```bash
+# trial run, get first 10 matched line
+# due to internal implementation, #result may still larger than given number
+node ./hgrep.js --gzip -p PATTERNS -l 10 [FILE...]
+```
+
+```bash
+# match multiple pattern (or)
+node ./hgrep.js --gzip -p 社會住宅 -p 包租代管 [FILE...]
 ```

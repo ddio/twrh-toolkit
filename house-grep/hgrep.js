@@ -15,6 +15,12 @@ const OUTPUT_HEADER = [
   { id: 'etc', title: '詳細資訊' }
 ]
 
+function isMatched(title, desp, patterns) {
+  return patterns.some((pattern) => {
+    return title.includes(pattern) || desp.includes(pattern)
+  })
+}
+
 function filterOneFile ({ gzip, pattern, appendLine, limit, file }) {
   let readStream = fs.createReadStream(file)
   if (gzip) {
@@ -45,14 +51,14 @@ function filterOneFile ({ gzip, pattern, appendLine, limit, file }) {
       }
 
       const title = detail.title || ''
-      let desp = detail.desp.join('\n') || ''
+      let desp = detail.remark?.content || ''
 
-      if (!desp) {
-        // for new 591 data
-        desp = detail.remark?.content || ''
+      if (!desp && detail.desp) {
+        // for old 591 data
+        desp = detail.desp.join('') || ''
       }
 
-      if (title.includes(pattern) || desp.includes(pattern)) {
+      if (isMatched(title, desp, pattern)) {
         appendLine({
           id: data[1],
           createdAt: data[3],
@@ -78,7 +84,7 @@ function filterOneFile ({ gzip, pattern, appendLine, limit, file }) {
 async function main () {
   const argOpts = [
     { name: 'gzip', alias: 'c', type: Boolean },
-    { name: 'pattern', alias: 'p', type: String },
+    { name: 'pattern', alias: 'p', type: String, multiple: true },
     { name: 'output', alias: 'o', type: String },
     { name: 'limit', alias: 'l', type: Number, default: 0 },
     { name: 'files', alias: 'f', type: String, multiple: true, defaultOption: true, default: [] }
