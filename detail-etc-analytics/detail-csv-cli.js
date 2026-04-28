@@ -1,18 +1,19 @@
 #!/usr/bin/env node
 
 const fs = require('fs')
+const path = require('path')
 const zlib = require('zlib')
-const { finished } = require('stream')
+const os = require('os')
 const parseArgs = require('command-line-args')
 const CsvReadableStream = require('csv-reader')
 const AutoDetectDecoderStream = require('autodetect-decoder-stream')
 const { createArrayCsvStringifier } = require('csv-writer')
+const { Worker, isMainThread, parentPort, workerData } = require('worker_threads')
 
 const HEADER = ['house_id', 'vendor_house_id', 'detail_dict', 'created', 'updated']
 const COL = { detail_dict: 2, created: 3, updated: 4 }
 
 // --- JSON path resolver ---
-// Supports: "title", "remark.content", "tags[].value", "info[].name"
 function resolveJsonPath (obj, path) {
   const segments = []
   for (const part of path.split('.')) {
@@ -48,7 +49,7 @@ function resolveJsonPath (obj, path) {
 // --- Date helpers ---
 function getDateKey (dateStr, groupBy) {
   if (!dateStr) return null
-  const d = dateStr.slice(0, 10) // "2022-01-18"
+  const d = dateStr.slice(0, 10)
   if (groupBy === 'year') return d.slice(0, 4)
   if (groupBy === 'month') return d.slice(0, 7)
   if (groupBy === 'day') return d
@@ -61,6 +62,49 @@ function inDateRange (dateStr, after, before) {
   if (after && d < after) return false
   if (before && d > before) return false
   return true
+}
+
+// --- Progress indicator ---
+function createProgress (totalFiles) {
+  const isTTY = process.stderr.isTTY
+  const state = { rows: 0, matched: 0, filesDone: 0, totalFiles, startTime: Date.now() }
+  let timer = null
+
+  function format () {
+    const elapsed = ((Date.now() - state.startTime) / 1000).toFixed(1)
+    const parts = [`${state.rows.toLocaleString()} rows`]
+    if (state.matched > 0) parts.push(`${state.matched.toLocaleString()} matched`)
+    if (state.totalFiles > 1) parts.push(`${state.filesDone}/${state.totalFiles} files`)
+    parts.push(`${elapsed}s`)
+    return parts.join(' | ')
+  }
+
+  function render () {
+    if (!isTTY) return
+    process.stderr.write(`\r\x1b[KProcessing: ${format()}`)
+  }
+
+  function start () {
+    if (timer) return
+    timer = setInterval(render, 500)
+  }
+
+  function tick (rows, matched) {
+    state.rows += rows
+    state.matched += (matched || 0)
+  }
+
+  function fileDone () {
+    state.filesDone++
+  }
+
+  function stop () {
+    if (timer) { clearInterval(timer); timer = null }
+    if (isTTY) process.stderr.write('\r\x1b[K')
+    process.stderr.write(`Done: ${format()}\n`)
+  }
+
+  return { start, tick, fileDone, stop, state }
 }
 
 // --- Table formatter ---
@@ -119,6 +163,7 @@ const SUBCMDS = {
     { name: 'after', type: String },
     { name: 'before', type: String },
     { name: 'group-by', type: String },
+    { name: 'parallel', alias: 'j', type: Number },
     { name: 'files', type: String, multiple: true, defaultOption: true, defaultValue: [] }
   ],
   query: [
@@ -129,6 +174,12 @@ const SUBCMDS = {
     { name: 'after', type: String },
     { name: 'before', type: String },
     { name: 'group-by', type: String },
+    { name: 'parallel', alias: 'j', type: Number },
+    { name: 'files', type: String, multiple: true, defaultOption: true, defaultValue: [] }
+  ],
+  split: [
+    { name: 'rows', alias: 'n', type: Number },
+    { name: 'output-dir', alias: 'o', type: String },
     { name: 'files', type: String, multiple: true, defaultOption: true, defaultValue: [] }
   ]
 }
@@ -139,13 +190,225 @@ function usage () {
 
 Commands:
   head   -n NUM                                    Show first N rows (default 10)
-  count  --by created|updated [--after DATE] [--before DATE] [--group-by year|month|day]
-  query  --path JSONPATH --match STRING [--count] [--by created|updated] [--after DATE] [--before DATE] [--group-by year|month|day]
+  count  --by created|updated [--after DATE] [--before DATE] [--group-by year|month|day] [-j NUM]
+  query  --path JSONPATH --match STRING [--count] [--by created|updated] [--after DATE] [--before DATE] [--group-by year|month|day] [-j NUM]
+  split  --rows N [--output-dir DIR]               Split a file into chunks of N rows each
 
-Files ending in .gz are decompressed automatically.`)
+Files ending in .gz are decompressed automatically.
+Multiple files are processed in parallel (-j defaults to CPU count).`)
+}
+
+// --- Worker pool ---
+function runWorkerPool (files, cmd, args, parallelism) {
+  return new Promise((resolve, reject) => {
+    const results = []
+    const rows = []
+    let fileIdx = 0
+    let active = 0
+    let totalRows = 0
+    let totalMatched = 0
+    let filesDone = 0
+
+    const progress = createProgress(files.length)
+    progress.start()
+
+    function spawnNext () {
+      if (fileIdx >= files.length) {
+        if (active === 0) {
+          progress.stop()
+          resolve({ results, rows })
+        }
+        return
+      }
+
+      const file = files[fileIdx++]
+      active++
+
+      const worker = new Worker(__filename, {
+        workerData: { file, cmd, args }
+      })
+
+      worker.on('message', (msg) => {
+        if (msg.type === 'progress') {
+          progress.tick(msg.rows, msg.matched)
+        } else if (msg.type === 'result') {
+          results.push(msg.counts)
+        } else if (msg.type === 'row') {
+          rows.push(msg.row)
+        }
+      })
+
+      worker.on('exit', (code) => {
+        active--
+        progress.fileDone()
+        if (code !== 0) {
+          reject(new Error(`Worker exited with code ${code} for ${file}`))
+          return
+        }
+        spawnNext()
+      })
+
+      worker.on('error', reject)
+    }
+
+    for (let i = 0; i < parallelism; i++) {
+      spawnNext()
+    }
+  })
+}
+
+// --- Worker entry point ---
+function workerMain () {
+  const { file, cmd, args } = workerData
+
+  if (cmd === 'count') {
+    workerCount(file, args)
+  } else if (cmd === 'query') {
+    workerQuery(file, args)
+  }
+}
+
+function workerCount (file, args) {
+  const colIdx = COL[args.by]
+  const after = args.after || null
+  const before = args.before || null
+  const groupBy = args['group-by'] || null
+  const counts = { total: 0 }
+  let batchRows = 0
+
+  const csvStream = buildCsvStream(file)
+  csvStream.on('data', (row) => {
+    const dateStr = row[colIdx]
+    if (after || before) {
+      if (!inDateRange(dateStr, after, before)) {
+        batchRows++
+        if (batchRows >= 10000) {
+          parentPort.postMessage({ type: 'progress', rows: batchRows, matched: 0 })
+          batchRows = 0
+        }
+        return
+      }
+    }
+    counts.total++
+    batchRows++
+    if (groupBy) {
+      const key = getDateKey(dateStr, groupBy)
+      if (key) counts[key] = (counts[key] || 0) + 1
+    }
+    if (batchRows >= 10000) {
+      parentPort.postMessage({ type: 'progress', rows: batchRows, matched: 0 })
+      batchRows = 0
+    }
+  })
+  csvStream.on('end', () => {
+    if (batchRows > 0) parentPort.postMessage({ type: 'progress', rows: batchRows, matched: 0 })
+    parentPort.postMessage({ type: 'result', counts })
+  })
+  csvStream.on('error', (err) => {
+    throw err
+  })
+}
+
+function workerQuery (file, args) {
+  const jsonPath = args.path
+  const matchStr = args.match
+  const doCount = args.count
+  const byField = args.by || null
+  const after = args.after || null
+  const before = args.before || null
+  const groupBy = args['group-by'] || null
+
+  const counts = { total: 0 }
+  let batchRows = 0
+  let batchMatched = 0
+
+  const csvStream = buildCsvStream(file)
+  csvStream.on('data', (row) => {
+    batchRows++
+
+    if (byField && (after || before)) {
+      const dateStr = row[COL[byField]]
+      if (!inDateRange(dateStr, after, before)) {
+        if (batchRows >= 10000) {
+          parentPort.postMessage({ type: 'progress', rows: batchRows, matched: batchMatched })
+          batchRows = 0; batchMatched = 0
+        }
+        return
+      }
+    }
+
+    let detail
+    try {
+      detail = JSON.parse(row[COL.detail_dict])
+    } catch (e) {
+      if (batchRows >= 10000) {
+        parentPort.postMessage({ type: 'progress', rows: batchRows, matched: batchMatched })
+        batchRows = 0; batchMatched = 0
+      }
+      return
+    }
+
+    const values = resolveJsonPath(detail, jsonPath)
+    const matched = values.some(v => {
+      const s = typeof v === 'string' ? v : JSON.stringify(v)
+      return s.includes(matchStr)
+    })
+    if (!matched) {
+      if (batchRows >= 10000) {
+        parentPort.postMessage({ type: 'progress', rows: batchRows, matched: batchMatched })
+        batchRows = 0; batchMatched = 0
+      }
+      return
+    }
+
+    batchMatched++
+
+    if (doCount) {
+      counts.total++
+      if (groupBy && byField) {
+        const key = getDateKey(row[COL[byField]], groupBy)
+        if (key) counts[key] = (counts[key] || 0) + 1
+      }
+    } else {
+      parentPort.postMessage({ type: 'row', row: Array.from(row) })
+    }
+
+    if (batchRows >= 10000) {
+      parentPort.postMessage({ type: 'progress', rows: batchRows, matched: batchMatched })
+      batchRows = 0; batchMatched = 0
+    }
+  })
+  csvStream.on('end', () => {
+    if (batchRows > 0) parentPort.postMessage({ type: 'progress', rows: batchRows, matched: batchMatched })
+    if (doCount) {
+      parentPort.postMessage({ type: 'result', counts })
+    }
+  })
+  csvStream.on('error', (err) => {
+    throw err
+  })
+}
+
+function mergeCounts (results) {
+  const merged = { total: 0 }
+  for (const counts of results) {
+    for (const [key, val] of Object.entries(counts)) {
+      merged[key] = (merged[key] || 0) + val
+    }
+  }
+  return merged
 }
 
 // --- Main ---
+if (!isMainThread) {
+  workerMain()
+} else {
+  main().catch(err => {
+    console.error(err.message)
+    process.exit(1)
+  })
+}
+
 async function main () {
   const mainArgs = parseArgs(
     [{ name: 'command', defaultOption: true }],
@@ -173,6 +436,8 @@ async function main () {
     await cmdCount(files, args)
   } else if (cmd === 'query') {
     await cmdQuery(files, args)
+  } else if (cmd === 'split') {
+    await cmdSplit(files, args)
   }
 }
 
@@ -212,32 +477,54 @@ async function cmdCount (files, args) {
     process.exit(1)
   }
 
+  const groupBy = args['group-by'] || null
+  const parallelism = Math.min(args.parallel || os.cpus().length, files.length)
+
+  if (files.length > 1 && parallelism > 1) {
+    const { results } = await runWorkerPool(files, 'count', args, parallelism)
+    const merged = mergeCounts(results)
+    printCountTable(merged, groupBy)
+    return
+  }
+
   const colIdx = COL[byField]
   const after = args.after || null
   const before = args.before || null
-  const groupBy = args['group-by'] || null
   const counts = { total: 0 }
+  const progress = createProgress(files.length)
+  progress.start()
 
   for (const file of files) {
     const csvStream = buildCsvStream(file)
 
     await new Promise((resolve, reject) => {
+      let batchRows = 0
       csvStream.on('data', (row) => {
+        batchRows++
         const dateStr = row[colIdx]
         if (after || before) {
-          if (!inDateRange(dateStr, after, before)) return
+          if (!inDateRange(dateStr, after, before)) {
+            if (batchRows >= 10000) { progress.tick(batchRows); batchRows = 0 }
+            return
+          }
         }
         counts.total++
         if (groupBy) {
           const key = getDateKey(dateStr, groupBy)
           if (key) counts[key] = (counts[key] || 0) + 1
         }
+        if (batchRows >= 10000) { progress.tick(batchRows); batchRows = 0 }
       })
-      csvStream.on('end', resolve)
+      csvStream.on('end', () => {
+        if (batchRows > 0) progress.tick(batchRows)
+        progress.fileDone()
+        resolve()
+      })
       csvStream.on('error', reject)
     })
   }
 
+  progress.stop()
   printCountTable(counts, groupBy)
 }
 
@@ -269,25 +556,55 @@ async function cmdQuery (files, args) {
     process.exit(1)
   }
 
+  const parallelism = Math.min(args.parallel || os.cpus().length, files.length)
+
+  if (files.length > 1 && parallelism > 1) {
+    const { results, rows } = await runWorkerPool(files, 'query', args, parallelism)
+    if (doCount) {
+      const merged = mergeCounts(results)
+      printCountTable(merged, groupBy)
+    } else {
+      if (rows.length > 0) {
+        console.log(HEADER.join(','))
+        for (const row of rows) {
+          console.log(csvStringify(row))
+        }
+      }
+    }
+    return
+  }
+
   const counts = { total: 0 }
   let headerPrinted = false
+  const progress = createProgress(files.length)
+  progress.start()
 
   for (const file of files) {
     const csvStream = buildCsvStream(file)
 
     await new Promise((resolve, reject) => {
+      let batchRows = 0
+      let batchMatched = 0
       csvStream.on('data', (row) => {
-        // Date range filter (applies to both count and raw output modes)
+        batchRows++
+
         if (byField && (after || before)) {
           const dateStr = row[COL[byField]]
-          if (!inDateRange(dateStr, after, before)) return
+          if (!inDateRange(dateStr, after, before)) {
+            if (batchRows >= 10000) {
+              progress.tick(batchRows, batchMatched); batchRows = 0; batchMatched = 0
+            }
+            return
+          }
         }
 
-        // JSON path match
         let detail
         try {
           detail = JSON.parse(row[COL.detail_dict])
         } catch (e) {
+          if (batchRows >= 10000) {
+            progress.tick(batchRows, batchMatched); batchRows = 0; batchMatched = 0
+          }
           return
         }
 
@@ -296,7 +613,14 @@ async function cmdQuery (files, args) {
           const s = typeof v === 'string' ? v : JSON.stringify(v)
           return s.includes(matchStr)
         })
-        if (!matched) return
+        if (!matched) {
+          if (batchRows >= 10000) {
+            progress.tick(batchRows, batchMatched); batchRows = 0; batchMatched = 0
+          }
+          return
+        }
+
+        batchMatched++
 
         if (doCount) {
           counts.total++
@@ -311,18 +635,107 @@ async function cmdQuery (files, args) {
           }
           console.log(csvStringify(row))
         }
+
+        if (batchRows >= 10000) {
+          progress.tick(batchRows, batchMatched); batchRows = 0; batchMatched = 0
+        }
       })
-      csvStream.on('end', resolve)
+      csvStream.on('end', () => {
+        if (batchRows > 0) progress.tick(batchRows, batchMatched)
+        progress.fileDone()
+        resolve()
+      })
       csvStream.on('error', reject)
     })
   }
 
+  progress.stop()
   if (doCount) {
     printCountTable(counts, groupBy)
   }
 }
 
-main().catch(err => {
-  console.error(err.message)
-  process.exit(1)
-})
+// --- split command ---
+async function cmdSplit (files, args) {
+  const rowsPerChunk = args.rows
+  if (!rowsPerChunk || rowsPerChunk <= 0) {
+    console.error('Error: --rows N is required (positive integer)')
+    process.exit(1)
+  }
+
+  for (const file of files) {
+    const outputDir = args['output-dir'] || path.dirname(file)
+    const basename = path.basename(file).replace(/\.csv(\.gz)?$/, '')
+    let chunkIdx = 0
+    let rowsInChunk = 0
+    let totalRows = 0
+    let gzStream = null
+    let writeStream = null
+    let pendingDrain = null
+
+    const progress = createProgress(1)
+    progress.start()
+
+    function openChunk () {
+      chunkIdx++
+      const chunkName = `${basename}.part-${String(chunkIdx).padStart(3, '0')}.csv.gz`
+      const chunkPath = path.join(outputDir, chunkName)
+      writeStream = fs.createWriteStream(chunkPath)
+      gzStream = zlib.createGzip()
+      gzStream.pipe(writeStream)
+      gzStream.write(HEADER.join(',') + '\n')
+      rowsInChunk = 0
+    }
+
+    function closeChunk () {
+      return new Promise((resolve) => {
+        if (!gzStream) { resolve(); return }
+        writeStream.on('finish', resolve)
+        gzStream.end()
+      })
+    }
+
+    const csvStream = buildCsvStream(file)
+
+    await new Promise((resolve, reject) => {
+      csvStream.on('data', (row) => {
+        if (!gzStream || rowsInChunk >= rowsPerChunk) {
+          if (gzStream) {
+            csvStream.pause()
+            closeChunk().then(() => {
+              openChunk()
+              writeRow(row)
+              csvStream.resume()
+            }).catch(reject)
+            return
+          }
+          openChunk()
+        }
+        writeRow(row)
+      })
+
+      function writeRow (row) {
+        const ok = gzStream.write(csvStringify(row) + '\n')
+        rowsInChunk++
+        totalRows++
+        progress.tick(1)
+        if (!ok && !pendingDrain) {
+          csvStream.pause()
+          pendingDrain = true
+          gzStream.once('drain', () => {
+            pendingDrain = false
+            csvStream.resume()
+          })
+        }
+      }
+
+      csvStream.on('end', () => {
+        closeChunk().then(resolve).catch(reject)
+      })
+      csvStream.on('error', reject)
+    })
+
+    progress.stop()
+    process.stderr.write(`Split ${file}: ${totalRows.toLocaleString()} rows → ${chunkIdx} chunks in ${outputDir}/\n`)
+  }
+}

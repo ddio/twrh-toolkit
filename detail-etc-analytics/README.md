@@ -1,6 +1,6 @@
 # detail-csv-cli
 
-CLI tool for searching and counting rows in TWRH `detail_dict` CSV datasets. Supports `.gz` compressed files.
+CLI tool for searching and counting rows in TWRH `detail_dict` CSV datasets. Supports `.gz` compressed files and parallel processing of multiple files via `worker_threads`.
 
 ## Install
 
@@ -40,6 +40,7 @@ node detail-csv-cli.js count --by updated --group-by month house_etc_full.csv.gz
 | `--after DATE` | Include only rows on or after this date (YYYY-MM-DD) |
 | `--before DATE` | Include only rows on or before this date (YYYY-MM-DD) |
 | `--group-by year\|month\|day` | Group counts by time period |
+| `-j NUM` | Number of parallel workers (default: CPU count). Applies when multiple files are given |
 
 ### `query` — Search inside `detail_dict` JSON
 
@@ -64,6 +65,39 @@ node detail-csv-cli.js query --path tags[].value --match 可養寵 house_etc_ful
 | `--after DATE` | Include only rows on or after this date |
 | `--before DATE` | Include only rows on or before this date |
 | `--group-by year\|month\|day` | Group counts by time period (requires `--by`) |
+| `-j NUM` | Number of parallel workers (default: CPU count). Applies when multiple files are given |
+
+### `split` — Split a large file into chunks
+
+```bash
+# Split into 500,000-row chunks
+node detail-csv-cli.js split --rows 500000 house_etc_full.csv.gz
+
+# Specify output directory
+node detail-csv-cli.js split --rows 500000 --output-dir ./chunks house_etc_full.csv.gz
+```
+
+Output files are named `<basename>.part-001.csv.gz`, `<basename>.part-002.csv.gz`, etc. Each chunk includes a header row.
+
+| Option | Description |
+|--------|-------------|
+| `--rows N`, `-n N` | **(required)** Number of rows per chunk |
+| `--output-dir DIR`, `-o DIR` | Output directory (default: same as input file) |
+
+### Parallel Processing
+
+When multiple files are passed to `count` or `query`, they are processed in parallel using `worker_threads`. Use `split` first to break a large file into chunks, then run queries on the chunks:
+
+```bash
+# Split once
+node detail-csv-cli.js split --rows 500000 house_etc_full.csv.gz
+
+# Query in parallel across chunks
+node detail-csv-cli.js count --by created --group-by month house_etc_full.part-*.csv.gz
+node detail-csv-cli.js query --path title --match 套房 --count --by created house_etc_full.part-*.csv.gz
+```
+
+All commands show a progress indicator on stderr with row count, elapsed time, and file progress.
 
 ## JSON Path Syntax
 
