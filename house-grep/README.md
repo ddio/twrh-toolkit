@@ -5,7 +5,7 @@ This toolkit provide grep-like functionality for [TWRH dataset](https://rentalho
 As text related field, including title and description of the rental house, is not release publicly.
 Please run TWRH crawler yourself, so to download required field.
 
-## Example usage
+## hgrep example usage
 
 ```bash
 # grep PATTERNS in given FILEs
@@ -27,3 +27,7 @@ node ./hgrep.js --gzip -p PATTERNS -l 10 [FILE...]
 # match multiple pattern (or)
 node ./hgrep.js --gzip -p 社會住宅 -p 包租代管 [FILE...]
 ```
+
+## filter-dataset example usage
+
+This script use

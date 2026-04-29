@@ -1,0 +1,11 @@
+{
+  "name": "detail-etc-analytics",
+  "version": "1.0.0",
+  "description": "CLI tools for analyzing TWRH detail_dict CSV datasets",
+  "dependencies": {
+    "autodetect-decoder-stream": "^2.0.2",
+    "command-line-args": "^5.2.1",
+    "csv-reader": "^1.0.10",
+    "csv-writer": "^1.6.0"
+  }
+}
