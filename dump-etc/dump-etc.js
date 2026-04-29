@@ -2,6 +2,7 @@ const parseArgs = require('command-line-args')
 const { Client } = require('pg')
 const fs = require('fs')
 const path = require('path')
+const zlib = require('zlib')
 
 const REQUIRED_FIELDS = ['house_id', 'vendor_id', 'vendor_house_id', 'created', 'updated']
 
@@ -11,6 +12,7 @@ const optionDefs = [
   { name: 'fields', alias: 'f', type: String, multiple: true, defaultValue: [], description: 'Extra fields to export (e.g. detail_dict)' },
   { name: 'batch', alias: 'b', type: Number, defaultValue: 5000, description: 'Rows per FETCH from cursor' },
   { name: 'split', alias: 's', type: Number, defaultValue: 200000, description: 'Max rows per output file' },
+  { name: 'gzip', alias: 'z', type: Boolean, defaultValue: false, description: 'Gzip output files' },
   { name: 'ssl-ca', type: String, description: 'Path to CA certificate PEM file for SSL' },
   { name: 'help', alias: 'h', type: Boolean },
 ]
@@ -26,12 +28,13 @@ Options:
   -f, --fields  Extra fields to include (e.g. -f detail_dict -f could_be_rooftop)
   -b, --batch   Rows per cursor FETCH (default: 5000)
   -s, --split   Max rows per output file (default: 200000)
+  -z, --gzip    Gzip output files (.jsonl.gz)
   --ssl-ca      Path to CA certificate PEM file for SSL
   -h, --help    Show this help
 
 Example:
   node dump-etc.js --db postgres://user:pass@localhost/twrh -f detail_dict -s 200000
-  node dump-etc.js --db postgres://user:pass@prod/twrh --ssl-ca ca.pem -f detail_dict
+  node dump-etc.js --db postgres://user:pass@prod/twrh --ssl-ca ca.pem -f detail_dict -z
   DATABASE_URL=postgres://... node dump-etc.js -f detail_dict -f detail_raw`)
 }
 
@@ -47,10 +50,10 @@ function buildQuery (extraFields) {
 }
 
 class YearFileWriter {
-  constructor (outputDir, splitSize, fieldNames) {
+  constructor (outputDir, splitSize, useGzip) {
     this.outputDir = outputDir
     this.splitSize = splitSize
-    this.fieldNames = fieldNames
+    this.useGzip = useGzip
     this.writers = new Map()
     this.counts = new Map()
   }
@@ -63,15 +66,23 @@ class YearFileWriter {
   _getStream (year) {
     const key = this._key(year)
     if (!this.writers.has(key)) {
-      const filePath = path.join(this.outputDir, `house_etc_${key}.jsonl`)
-      this.writers.set(key, fs.createWriteStream(filePath, { flags: 'w' }))
+      const ext = this.useGzip ? 'jsonl.gz' : 'jsonl'
+      const filePath = path.join(this.outputDir, `house_etc_${key}.${ext}`)
+      const fileStream = fs.createWriteStream(filePath)
+      if (this.useGzip) {
+        const gz = zlib.createGzip()
+        gz.pipe(fileStream)
+        this.writers.set(key, { write: gz, file: fileStream })
+      } else {
+        this.writers.set(key, { write: fileStream, file: fileStream })
+      }
     }
     return this.writers.get(key)
   }
 
   write (year, obj) {
-    const stream = this._getStream(year)
-    stream.write(JSON.stringify(obj) + '\n')
+    const { write } = this._getStream(year)
+    write.write(JSON.stringify(obj) + '\n')
     this.counts.set(year, (this.counts.get(year) || 0) + 1)
   }
 
@@ -80,10 +91,14 @@ class YearFileWriter {
     for (const [year, count] of this.counts.entries()) {
       summary.push({ year, rows: count })
     }
-    for (const stream of this.writers.values()) {
-      stream.end()
+    const promises = []
+    for (const { write, file } of this.writers.values()) {
+      promises.push(new Promise(resolve => {
+        file.on('close', resolve)
+        write.end()
+      }))
     }
-    return summary.sort((a, b) => a.year - b.year)
+    return { summary: summary.sort((a, b) => a.year - b.year), done: Promise.all(promises) }
   }
 }
 
@@ -122,7 +137,7 @@ async function main () {
   await client.query('BEGIN')
   await client.query(`DECLARE ${cursorName} CURSOR FOR ${query}`)
 
-  const writer = new YearFileWriter(args.output, args.split, allFields)
+  const writer = new YearFileWriter(args.output, args.split, args.gzip)
   let totalRows = 0
   let batch
 
@@ -150,7 +165,8 @@ async function main () {
   await client.query('COMMIT')
   await client.end()
 
-  const summary = writer.close()
+  const { summary, done } = writer.close()
+  await done
   process.stderr.write('\n')
   console.log(`Done. ${totalRows.toLocaleString()} rows total.`)
   console.log('Files by year:')
