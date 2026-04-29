@@ -11,6 +11,7 @@ const optionDefs = [
   { name: 'fields', alias: 'f', type: String, multiple: true, defaultValue: [], description: 'Extra fields to export (e.g. detail_dict)' },
   { name: 'batch', alias: 'b', type: Number, defaultValue: 5000, description: 'Rows per FETCH from cursor' },
   { name: 'split', alias: 's', type: Number, defaultValue: 200000, description: 'Max rows per output file' },
+  { name: 'ssl-ca', type: String, description: 'Path to CA certificate PEM file for SSL' },
   { name: 'help', alias: 'h', type: Boolean },
 ]
 
@@ -25,10 +26,12 @@ Options:
   -f, --fields  Extra fields to include (e.g. -f detail_dict -f could_be_rooftop)
   -b, --batch   Rows per cursor FETCH (default: 5000)
   -s, --split   Max rows per output file (default: 200000)
+  --ssl-ca      Path to CA certificate PEM file for SSL
   -h, --help    Show this help
 
 Example:
   node dump-etc.js --db postgres://user:pass@localhost/twrh -f detail_dict -s 200000
+  node dump-etc.js --db postgres://user:pass@prod/twrh --ssl-ca ca.pem -f detail_dict
   DATABASE_URL=postgres://... node dump-etc.js -f detail_dict -f detail_raw`)
 }
 
@@ -104,7 +107,15 @@ async function main () {
 
   fs.mkdirSync(args.output, { recursive: true })
 
-  const client = new Client({ connectionString })
+  const isLocal = connectionString.includes('localhost') || connectionString.includes('127.0.0.1')
+  let ssl = false
+  if (args['ssl-ca']) {
+    ssl = { ca: fs.readFileSync(args['ssl-ca'], 'utf8'), rejectUnauthorized: true }
+  } else if (!isLocal) {
+    ssl = { rejectUnauthorized: false }
+  }
+
+  const client = new Client({ connectionString, ssl })
   await client.connect()
 
   const cursorName = 'dump_etc_cursor'
