@@ -80,9 +80,12 @@ class YearFileWriter {
     return this.writers.get(key)
   }
 
-  write (year, obj) {
+  async write (year, obj) {
     const { write } = this._getStream(year)
-    write.write(JSON.stringify(obj) + '\n')
+    const ok = write.write(JSON.stringify(obj) + '\n')
+    if (!ok) {
+      await new Promise(resolve => write.once('drain', resolve))
+    }
     this.counts.set(year, (this.counts.get(year) || 0) + 1)
   }
 
@@ -152,7 +155,7 @@ async function main () {
       for (const f of allFields) {
         obj[f] = row[f]
       }
-      writer.write(year, obj)
+      await writer.write(year, obj)
       totalRows++
     }
 
