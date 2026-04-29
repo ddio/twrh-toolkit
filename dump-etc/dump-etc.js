@@ -10,7 +10,7 @@ const optionDefs = [
   { name: 'db', type: String, description: 'PostgreSQL connection string (or set DATABASE_URL env)' },
   { name: 'output', alias: 'o', type: String, defaultValue: './output', description: 'Output directory' },
   { name: 'fields', alias: 'f', type: String, multiple: true, defaultValue: [], description: 'Extra fields to export (e.g. detail_dict)' },
-  { name: 'batch', alias: 'b', type: Number, defaultValue: 5000, description: 'Rows per FETCH from cursor' },
+  { name: 'batch', alias: 'b', type: Number, defaultValue: 1000, description: 'Rows per FETCH from cursor' },
   { name: 'split', alias: 's', type: Number, defaultValue: 200000, description: 'Max rows per output file' },
   { name: 'gzip', alias: 'z', type: Boolean, defaultValue: false, description: 'Gzip output files' },
   { name: 'ssl-ca', type: String, description: 'Path to CA certificate PEM file for SSL' },
@@ -26,7 +26,7 @@ Options:
   --db        PostgreSQL connection string (default: DATABASE_URL env)
   -o, --output  Output directory (default: ./output)
   -f, --fields  Extra fields to include (e.g. -f detail_dict -f could_be_rooftop)
-  -b, --batch   Rows per cursor FETCH (default: 5000)
+  -b, --batch   Rows per cursor FETCH (default: 1000)
   -s, --split   Max rows per output file (default: 200000)
   -z, --gzip    Gzip output files (.jsonl.gz)
   --ssl-ca      Path to CA certificate PEM file for SSL
@@ -38,11 +38,16 @@ Example:
   DATABASE_URL=postgres://... node dump-etc.js -f detail_dict -f detail_raw`)
 }
 
+const JSON_FIELDS = new Set(['detail_dict', 'facilities', 'additional_fee', 'living_functions', 'transportation', 'imgs'])
+
 function buildQuery (extraFields) {
   const allFields = [...REQUIRED_FIELDS, ...extraFields]
   const selectCols = allFields.map(f => {
     if (f === 'created' || f === 'updated') {
       return `${f}, EXTRACT(YEAR FROM ${f})::int AS ${f}_year`
+    }
+    if (JSON_FIELDS.has(f)) {
+      return `${f}::text`
     }
     return f
   })
@@ -80,9 +85,18 @@ class YearFileWriter {
     return this.writers.get(key)
   }
 
-  async write (year, obj) {
+  async write (year, row, allFields) {
     const { write } = this._getStream(year)
-    const ok = write.write(JSON.stringify(obj) + '\n')
+    const parts = []
+    for (const f of allFields) {
+      const val = row[f]
+      if (JSON_FIELDS.has(f)) {
+        parts.push(`${JSON.stringify(f)}:${val === null ? 'null' : val}`)
+      } else {
+        parts.push(`${JSON.stringify(f)}:${JSON.stringify(val)}`)
+      }
+    }
+    const ok = write.write(`{${parts.join(',')}}\n`)
     if (!ok) {
       await new Promise(resolve => write.once('drain', resolve))
     }
@@ -150,12 +164,7 @@ async function main () {
     batch = await client.query(`FETCH ${args.batch} FROM ${cursorName}`)
 
     for (const row of batch.rows) {
-      const year = row.created_year
-      const obj = {}
-      for (const f of allFields) {
-        obj[f] = row[f]
-      }
-      await writer.write(year, obj)
+      await writer.write(row.created_year, row, allFields)
       totalRows++
     }
 
